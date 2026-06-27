@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LabQC Monitor - Pemantauan Kendali Mutu Glukosa</title>
+    <!-- React Core & DOM via CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <!-- Babel standalone compiler for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Tailwind CSS Engine -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js Engine -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- ExcelJS Spreadsheet Engine -->
+    <script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
+    <!-- jsPDF Engine -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght=300;400;500;600;700;800&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- INITIALIZATION DATABASE (Simulasi Supabase PostgreSQL di LocalStorage) ---
+        const INITIAL_CONTROL_LEVELS = {
+            Low: { mean_value: 80, sd_value: 3 },
+            Normal: { mean_value: 120, sd_value: 4 },
+            High: { mean_value: 240, sd_value: 8 }
+        };
+
+        if (!localStorage.getItem('control_levels')) {
+            localStorage.setItem('control_levels', JSON.stringify(INITIAL_CONTROL_LEVELS));
+        }
+        if (!localStorage.getItem('qc_records')) {
+            localStorage.setItem('qc_records', JSON.stringify([])); // MULAI DENGAN DATA KOSONG
+        }
+        if (!localStorage.getItem('auth_user')) {
+            localStorage.setItem('auth_user', JSON.stringify({ name: 'Admin Lab', email: 'supervisor@labqc.com', role: 'Supervisor' }));
+        }
+
+        // --- WESTGARD MULTI-RULE ENGINE (BAHASA INDONESIA) ---
+        function runWestgardEngine(currentResult, mean, sd, historyStack) {
+            const sdi = (currentResult - mean) / sd;
+            const absSDI = Math.abs(sdi);
+            
+            const pastSDIs = historyStack.map(h => h.sdi);
+            const pastResults = historyStack.map(h => h.qc_result);
+            
+            // Prioritas 1: 13s (Reject)
+            if (absSDI >= 3) {
+                return { status: 'Reject', rule: '13s', interpretation: 'Hasil QC keluar dari batas ±3 SD. Kontrol ditolak (Reject).' };
+            }
+            // Prioritas 2: 22s (Reject)
+            if (historyStack.length >= 1) {
+                const prevSDI = pastSDIs[0];
+                if ((sdi > 2 && prevSDI > 2) || (sdi < -2 && prevSDI < -2)) {
+                    return { status: 'Reject', rule: '22s', interpretation: 'Dua hasil QC berturut-turut melewati batas +2 SD atau -2 SD yang sama. Kontrol ditolak (Reject).' };
+                }
+            }
+            // Prioritas 3: R4s (Reject)
+            if (historyStack.length >= 1) {
+                const prevSDI = pastSDIs[0];
+                if (Math.abs(sdi - prevSDI) > 4) {
+                    return { status: 'Reject', rule: 'R4s', interpretation: 'Perbedaan (selisih) antara dua nilai SDI berturut-turut melebihi rentang 4 SD. Kontrol ditolak (Reject).' };
+                }
+            }
+            // Prioritas 4: 41s (Reject)
+            if (historyStack.length >= 3) {
+                const check4 = [sdi, ...pastSDIs.slice(0, 3)];
+                if (check4.every(v => v > 1) || check4.every(v => v < -1)) {
+                    return { status: 'Reject', rule: '41s', interpretation: 'Empat hasil QC berturut-turut melebihi batas +1 SD atau -1 SD yang sama. Kontrol ditolak (Reject).' };
+                }
+            }
+            // Prioritas 5: 10x (Reject)
+            if (historyStack.length >= 9) {
+                const check10 = [sdi, ...pastSDIs.slice(0, 9)];
+                if (check10.every(v => v > 0) || check10.every(v => v < 0)) {
+                    return { status: 'Reject', rule: '10x', interpretation: 'Sepuluh hasil QC berturut-turut berada di sisi Mean yang sama. Kontrol ditolak (Reject).' };
+                }
+            }
+            // Prioritas 6: Shift (Warning)
+            if (historyStack.length >= 6) {
+                const check7 = [sdi, ...pastSDIs.slice(0, 6)];
+                if (check7.every(v => v > 0) || check7.every(v => v < 0)) {
+                    return { status: 'Warning', rule: 'Shift', interpretation: 'Terdeteksi pergeseran sistemik (Shift)! Tujuh hasil QC berada di satu sisi Mean.' };
+                }
+            }
+            // Prioritas 7: Trend (Warning)
+            if (historyStack.length >= 6) {
+                const check7Res = [currentResult, ...pastResults.slice(0, 6)];
+                let ascending = true, descending = true;
+                for (let i = 0; i < 6; i++) {
+                    if (check7Res[i] <= check7Res[i+1]) ascending = false;
+                    if (check7Res[i] >= check7Res[i+1]) descending = false;
+                }
+                if (ascending) return { status: 'Warning', rule: 'Trend', interpretation: 'Terdeteksi tren peningkatan (Trend)! 7 nilai QC naik berturut-turut.' };
+                if (descending) return { status: 'Warning', rule: 'Trend', interpretation: 'Terdeteksi tren penurunan (Trend)! 7 nilai QC turun berturut-turut.' };
+            }
+            // Prioritas 8: 12s (Warning)
+            if (absSDI > 2 && absSDI < 3) {
+                return { status: 'Warning', rule: '12s', interpretation: 'Peringatan: Hasil QC berada di luar batas ±2 SD.' };
+            }
+
+            return { status: 'Accept', rule: '-', interpretation: 'Hasil QC berada dalam batas kendali yang dapat diterima.' };
+        }
+
+        // --- CORE APPLICATION ROUTER ---
+        function App() {
+            const [view, setView] = React.useState('Dashboard');
+            const [records, setRecords] = React.useState(JSON.parse(localStorage.getItem('qc_records')));
+            const [config, setConfig] = React.useState(JSON.parse(localStorage.getItem('control_levels')));
+            const [user, setUser] = React.useState(JSON.parse(localStorage.getItem('auth_user')));
+            const [notification, setNotification] = React.useState(null);
+
+            const triggerAlert = (type, message) => {
+                setNotification({ type, message });
+                setTimeout(() => setNotification(null), 4500);
+            };
+
+            const syncRecords = (newRecords) => {
+                setRecords(newRecords);
+                localStorage.setItem('qc_records', JSON.stringify(newRecords));
+            };
+
+            const syncConfig = (newConfig) => {
+                setConfig(newConfig);
+                localStorage.setItem('control_levels', JSON.stringify(newConfig));
+            };
+
+            return (
+                <div class="flex h-screen overflow-hidden bg-slate-50">
+                    {/* Top Toast Notification */}
+                    {notification && (
+                        <div class={`fixed top-4 right-4 z-50 p-4 rounded-xl shadow-xl border text-sm font-semibold flex items-center space-x-2 ${
+                            notification.type === 'success' ? 'bg-emerald-50 text-emerald-800 border-emerald-200' :
+                            notification.type === 'warning' ? 'bg-amber-50 text-amber-800 border-amber-200' :
+                            'bg-rose-50 text-rose-800 border-rose-200'
+                        }`}>
+                            <span>{notification.type === 'success' ? '✅' : notification.type === 'warning' ? '⚠️' : '❌'}</span>
+                            <span>{notification.message}</span>
+                        </div>
+                    )}
+
+                    {/* Sidebar */}
+                    <div class="w-64 bg-slate-900 text-white flex flex-col justify-between shadow-xl">
+                        <div>
+                            <div class="p-6 border-b border-slate-800">
+                                <h1 class="text-xl font-bold tracking-wider text-blue-500">LABQC MONITOR</h1>
+                                <p class="text-xs text-slate-400 mt-1 font-medium">Sistem Kendali Mutu Glukosa</p>
+                            </div>
+                            <nav class="p-4 space-y-1">
+                                {[
+                                    { id: 'Dashboard', label: 'Dashboard' },
+                                    { id: 'Input QC', label: 'Input QC' },
+                                    { id: 'Analysis', label: 'Analisis & Grafik' },
+                                    { id: 'QC History', label: 'Riwayat QC' },
+                                    { id: 'Reports', label: 'Laporan' },
+                                    { id: 'Settings', label: 'Pengaturan' }
+                                ].map(item => (
+                                    <button key={item.id} onClick={() => setView(item.id)}
+                                        class={`w-full text-left px-4 py-3 rounded-xl text-sm font-medium transition-all ${
+                                            view === item.id ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+                                        }`}>
+                                        {item.label}
+                                    </button>
+                                ))}
+                            </nav>
+                        </div>
+                        <div class="p-4 bg-slate-950 border-t border-slate-800 text-xs text-slate-400">
+                            <p class="font-bold text-blue-400 truncate">{user.name} ({user.role})</p>
+                            <p class="text-[10px] text-slate-500 mt-0.5 truncate">{user.email}</p>
+                        </div>
+                    </div>
+
+                    {/* Viewport Konten Utama */}
+                    <div class="flex-1 flex flex-col overflow-hidden">
+                        <header class="bg-white h-16 border-b border-slate-200 px-8 flex items-center justify-between shadow-sm">
+                            <h2 class="text-lg font-bold text-slate-800">
+                                {view === 'Analysis' ? 'ANALISIS & GRAFIK' : view === 'QC History' ? 'RIWAYAT QC' : view.toUpperCase()}
+                            </h2>
+                            <LiveClock />
+                        </header>
+                        <div class="flex-1 overflow-y-auto p-8">
+                            {view === 'Dashboard' && <DashboardComponent records={records} setView={setView} />}
+                            {view === 'Input QC' && <InputQCComponent config={config} records={records} syncRecords={syncRecords} triggerAlert={triggerAlert} />}
+                            {view === 'Analysis' && <AnalysisComponent records={records} config={config} />}
+                            {view === 'QC History' && <QCHistoryComponent records={records} />}
+                            {view === 'Reports' && <ReportsComponent records={records} />}
+                            {view === 'Settings' && <SettingsComponent config={config} syncConfig={syncConfig} triggerAlert={triggerAlert} user={user} setUser={setUser} />}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- JAM REAL-TIME ---
+        function LiveClock() {
+            const [time, setTime] = React.useState(new Date());
+            React.useEffect(() => {
+                const interval = setInterval(() => setTime(new Date()), 1000);
+                return () => clearInterval(interval);
+            }, []);
+            return (
+                <div class="text-xs font-mono font-medium bg-slate-100 text-slate-600 px-3 py-1.5 rounded-lg border border-slate-200">
+                    📅 {time.toLocaleDateString('id-ID')} | 🕒 {time.toLocaleTimeString('id-ID')}
+                </div>
+            );
+        }
+
+        // --- DASHBOARD COMPONENT ---
+        function DashboardComponent({ records, setView }) {
+            const todayStr = new Date().toISOString().split('T')[0];
+            
+            const stats = React.useMemo(() => {
+                const todayRecords = records.filter(r => r.qc_date === todayStr);
+                return {
+                    today: todayRecords.length,
+                    total: records.length,
+                    accept: records.filter(r => r.status === 'Accept').length,
+                    warning: records.filter(r => r.status === 'Warning').length,
+                    reject: records.filter(r => r.status === 'Reject').length
+                };
+            }, [records, todayStr]);
+
+            const latestRecord = records[records.length - 1] || null;
+            const violations = React.useMemo(() => records.filter(r => r.status !== 'Accept').slice(-4).reverse(), [records]);
+
+            React.useEffect(() => {
+                const canvas = document.getElementById('dashDistributionChart');
+                if (!canvas) return;
+                const matrix = { Low: 0, Normal: 0, High: 0 };
+                records.forEach(r => { if(matrix[r.control_level] !== undefined) matrix[r.control_level]++; });
+
+                const chart = new Chart(canvas, {
+                    type: 'bar',
+                    data: {
+                        labels: ['Level Low', 'Level Normal', 'Level High'],
+                        datasets: [{
+                            data: [matrix.Low, matrix.Normal, matrix.High],
+                            backgroundColor: ['#60A5FA', '#2563EB', '#1D4ED8'],
+                            borderRadius: 8,
+                            maxBarThickness: 45
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+                    }
+                });
+                return () => chart.destroy();
+            }, [records]);
+
+            return (
+                <div class="space-y-6">
+                    {/* Ringkasan Kartu Statistik */}
+                    <div class="grid grid-cols-1 md:grid-cols-5 gap-5">
+                        <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                            <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">QC Hari Ini</p>
+                            <h3 class="text-2xl font-bold text-slate-800 mt-1">{stats.today}</h3>
+                        </div>
+                        <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                            <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Total Rekor QC</p>
+                            <h3 class="text-2xl font-bold text-slate-800 mt-1">{stats.total}</h3>
+                        </div>
+                        <div class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm border-l-4 border-l-emerald-500">
+                            <p class="text-xs font-semibold text-emerald-600 uppercase tracking-wider">Accept</p>
+                            <h3 class="text-2xl font-bold text-emerald-700 mt-1">{stats.accept}</h3>
+                        </div>
+                        <div class="bg-white p-5 rounded-2xl border border-amber-200 shadow-sm border-l-4 border-l-amber-500">
+                            <p class="text-xs font-semibold text-amber-600 uppercase tracking-wider">Warning</p>
+                            <h3 class="text-2xl font-bold text-amber-700 mt-1">{stats.warning}</h3>
+                        </div>
+                        <div class="bg-white p-5 rounded-2xl border border-rose-200 shadow-sm border-l-4 border-l-rose-500">
+                            <p class="text-xs font-semibold text-rose-600 uppercase tracking-wider">Reject</p>
+                            <h3 class="text-2xl font-bold text-rose-700 mt-1">{stats.reject}</h3>
+                        </div>
+                    </div>
+
+                    {/* Banner Menu Pintas Cepat */}
+                    <div class="bg-gradient-to-r from-blue-600 to-indigo-700 p-6 rounded-2xl text-white flex items-center justify-between shadow-md">
+                        <div>
+                            <h4 class="text-lg font-bold">Pusat Input Kendali Mutu Glukosa</h4>
+                            <p class="text-xs text-blue-100 mt-0.5">Siap melakukan verifikasi analitis harian? Pastikan serum kontrol terkondisi sempurna.</p>
+                        </div>
+                        <button onClick={() => setView('Input QC')} class="bg-white text-blue-700 hover:bg-slate-50 font-semibold px-5 py-2.5 rounded-xl text-xs shadow transition-all">
+                            ➕ Tambah Rekor QC Baru
+                        </button>
+                    </div>
+
+                    {/* Grid Grafik & Pelanggaran */}
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm lg:col-span-2 h-72 flex flex-col">
+                            <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Aktivitas Grafik Distribusi Level Kontrol</h4>
+                            <div class="flex-1 relative">
+                                {records.length === 0 ? (
+                                    <div class="absolute inset-0 flex items-center justify-center text-xs text-slate-400 font-medium bg-slate-50 rounded-xl border border-dashed border-slate-200">Belum ada data QC yang tersedia.</div>
+                                ) : <canvas id="dashDistributionChart"></canvas>}
+                            </div>
+                        </div>
+
+                        <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm h-72 flex flex-col overflow-y-auto">
+                            <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Pelanggaran Aturan Westgard Terbaru</h4>
+                            {violations.length === 0 ? (
+                                <div class="my-auto text-center py-8 text-xs text-slate-400">Belum ada data QC yang tersedia.</div>
+                            ) : (
+                                <div class="space-y-2.5">
+                                    {violations.map((v, i) => (
+                                        <div key={i} class={`p-3 rounded-xl text-xs border ${v.status === 'Reject' ? 'bg-rose-50 border-rose-200 text-rose-900' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
+                                            <div class="flex justify-between font-bold">
+                                                <span>Level: {v.control_level} ({v.rule_violation})</span>
+                                                <span class="text-[10px] opacity-75">{v.qc_date}</span>
+                                            </div>
+                                            <p class="mt-1 opacity-90 text-[11px]">Hasil: {v.qc_result} mg/dL | SDI: {v.sdi.toFixed(2)}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Rekor Terakhir */}
+                    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                        <div class="px-6 py-4 border-b border-slate-200 bg-slate-50/50"><h4 class="text-xs font-bold text-slate-500 uppercase tracking-wider">Hasil Uji QC Terakhir yang Dimasukkan</h4></div>
+                        {latestRecord ? (
+                            <div class="p-6 grid grid-cols-2 md:grid-cols-6 gap-4 text-center">
+                                <div><p class="text-[10px] font-bold text-slate-400 uppercase">Waktu Log</p><p class="text-xs font-medium mt-1 text-slate-800">{latestRecord.qc_date} {latestRecord.qc_time}</p></div>
+                                <div><p class="text-[10px] font-bold text-slate-400 uppercase">Nama Analis</p><p class="text-xs font-medium mt-1 text-slate-800 truncate px-2">{latestRecord.analyst_name}</p></div>
+                                <div><p class="text-[10px] font-bold text-slate-400 uppercase">Level Kontrol</p><p class="text-xs font-bold mt-1 text-slate-700">{latestRecord.control_level}</p></div>
+                                <div><p class="text-[10px] font-bold text-slate-400 uppercase">Hasil</p><p class="text-sm font-black mt-0.5 text-blue-600">{latestRecord.qc_result} mg/dL</p></div>
+                                <div><p class="text-[10px] font-bold text-slate-400 uppercase">Nilai SDI</p><p class="text-xs font-mono font-bold mt-1 text-slate-800">{latestRecord.sdi.toFixed(2)}</p></div>
+                                <div>
+                                    <p class="text-[10px] font-bold text-slate-400 uppercase">Status</p>
+                                    <span class={`inline-block mt-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                                        latestRecord.status === 'Accept' ? 'bg-emerald-100 text-emerald-800' : latestRecord.status === 'Warning' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
+                                    }`}>{latestRecord.status}</span>
+                                </div>
+                            </div>
+                        ) : (
+                            <div class="p-8 text-center text-xs text-slate-400 font-medium">Belum ada data QC yang tersedia.</div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        // --- FORM INPUT QC COMPONENT ---
+        function InputQCComponent({ config, records, syncRecords, triggerAlert }) {
+            const [analyst, setAnalyst] = React.useState('');
+            const [level, setLevel] = React.useState('Low');
+            const [result, setResult] = React.useState('');
+            const [date, setDate] = React.useState(new Date().toISOString().split('T')[0]);
+            const [time, setTime] = React.useState(new Date().toTimeString().split(' ')[0].substring(0, 5));
+            const [latestFeedback, setLatestFeedback] = React.useState(null);
+
+            const activeMean = config[level].mean_value;
+            const activeSD = config[level].sd_value;
+
+            const handleSave = (e) => {
+                e.preventDefault();
+                if (!analyst.trim() || !result) {
+                    triggerAlert('error', 'Silakan lengkapi semua kolom yang wajib diisi.');
+                    return;
+                }
+                const numResult = parseFloat(result);
+                if (isNaN(numResult) || numResult <= 0) {
+                    triggerAlert('error', 'Hasil QC harus berupa nilai numerik positif.');
+                    return;
+                }
+
+                const calculatedSDI = (numResult - activeMean) / activeSD;
+                const filterHistory = records.filter(r => r.control_level === level).reverse();
+                const validationOutcome = runWestgardEngine(numResult, activeMean, activeSD, filterHistory);
+
+                const newRecord = {
+                    id: 'rc_' + Date.now(),
+                    analyst_name: analyst.trim(),
+                    control_level: level,
+                    qc_date: date,
+                    qc_time: time,
+                    qc_result: numResult,
+                    mean: activeMean,
+                    sd: activeSD,
+                    sdi: calculatedSDI,
+                    status: validationOutcome.status,
+                    rule_violation: validationOutcome.rule,
+                    interpretation: validationOutcome.interpretation,
+                    created_at: new Date().toISOString()
+                };
+
+                const updateStack = [...records, newRecord];
+                syncRecords(updateStack);
+                setLatestFeedback(newRecord);
+
+                if (validationOutcome.status === 'Accept') {
+                    triggerAlert('success', 'Rekor QC berhasil disimpan.');
+                } else {
+                    triggerAlert('warning', 'Terdeteksi pelanggaran Aturan Westgard.');
+                }
+
+                setResult(''); // Bersihkan kolom hasil
+            };
+
+            const resetForm = () => {
+                setAnalyst('');
+                setLevel('Low');
+                setResult('');
+                setDate(new Date().toISOString().split('T')[0]);
+                setTime(new Date().toTimeString().split(' ')[0].substring(0, 5));
+                setLatestFeedback(null);
+            };
+
+            return (
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm lg:col-span-2">
+                        <div class="mb-5">
+                            <h3 class="text-base font-bold text-slate-800">INPUT QC GLUKOSA</h3>
+                            <p class="text-xs text-slate-400">Catat data kendali mutu internal laboratorium harian.</p>
+                        </div>
+                        <form onSubmit={handleSave} class="space-y-5">
+                            <div>
+                                <label class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Nama Analis * (Ketik Manual)</label>
+                                <input type="text" value={analyst} onChange={e => setAnalyst(e.target.value)} placeholder="Masukkan nama analis secara lengkap..." required class="w-full border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none" />
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Tanggal</label>
+                                    <input type="date" value={date} onChange={e => setDate(e.target.value)} required class="w-full border border-slate-200 rounded-xl p-3 text-sm focus:outline-none" />
+                                </div>
+                                <div>
+                                    <label class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Waktu / Jam</label>
+                                    <input type="time" value={time} onChange={e => setTime(e.target.value)} required class="w-full border border-slate-200 rounded-xl p-3 text-sm focus:outline-none" />
+                                </div>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Parameter (Hanya Baca)</label>
+                                    <input type="text" value="Glukosa" readOnly class="w-full bg-slate-100 border border-slate-200 text-slate-500 font-bold rounded-xl p-3 text-sm cursor-not-allowed outline-none" />
+                                </div>
+                                <div>
+                                    <label class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Level Kontrol *</label>
+                                    <select value={level} onChange={e => setLevel(e.target.value)} class="w-full border border-slate-200 rounded-xl p-3 text-sm bg-white focus:outline-none">
+                                        <option value="Low">Low</option>
+                                        <option value="Normal">Normal</option>
+                                        <option value="High">High</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="p-4 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-3 gap-4">
+                                <div>
+                                    <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Target Mean</label>
+                                    <div class="bg-white border border-slate-200 rounded-lg p-2 font-mono text-xs text-slate-600 font-bold">{activeMean}</div>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Batas SD</label>
+                                    <div class="bg-white border border-slate-200 rounded-lg p-2 font-mono text-xs text-slate-600 font-bold">{activeSD}</div>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-blue-600 uppercase mb-1">Hasil QC (mg/dL) *</label>
+                                    <input type="number" step="0.01" value={result} onChange={e => setResult(e.target.value)} required placeholder="Nilai Uji" class="w-full border border-blue-200 rounded-lg p-1.5 text-xs font-mono font-bold text-blue-900 focus:outline-none focus:ring-1 focus:ring-blue-500" />
+                                </div>
+                            </div>
+
+                            <div class="flex space-x-3 pt-2">
+                                <button type="button" onClick={resetForm} class="w-1/3 bg-slate-100 hover:bg-slate-200 text-slate-600 font-semibold p-3 rounded-xl text-xs transition-all">Reset Form</button>
+                                <button type="submit" class="w-2/3 bg-blue-600 hover:bg-blue-700 text-white font-semibold p-3 rounded-xl text-xs shadow-sm transition-all">Simpan Rekor QC</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    {/* Evaluasi Mesin Westgard Real-Time */}
+                    <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
+                        <div>
+                            <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100 pb-2 mb-4">Evaluasi Aturan Real-Time</h4>
+                            {latestFeedback ? (
+                                <div class="space-y-4">
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div><p class="text-[10px] font-bold text-slate-400 uppercase">Input Hasil</p><p class="text-xl font-bold text-slate-800">{latestFeedback.qc_result} <span class="text-xs font-normal text-slate-400">mg/dL</span></p></div>
+                                        <div><p class="text-[10px] font-bold text-slate-400 uppercase">Skor Nilai SDI</p><p class="text-xl font-mono font-bold text-slate-700">{latestFeedback.sdi.toFixed(2)}</p></div>
+                                    </div>
+                                    <div>
+                                        <p class="text-[10px] font-bold text-slate-400 uppercase mb-1">Status Matriks</p>
+                                        <span class={`px-3 py-1 rounded-full text-xs font-black uppercase ${
+                                            latestFeedback.status === 'Accept' ? 'bg-emerald-100 text-emerald-800' : latestFeedback.status === 'Warning' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
+                                        }`}>{latestFeedback.status === 'Accept' ? 'Diterima' : latestFeedback.status === 'Warning' ? 'Peringatan' : 'Ditolak (Reject)'}</span>
+                                    </div>
+                                    <div><p class="text-[10px] font-bold text-slate-400 uppercase">Aturan yang Melanggar</p><p class="text-xs font-mono font-bold text-slate-700 mt-0.5">{latestFeedback.rule_violation}</p></div>
+                                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 text-xs text-slate-600 leading-relaxed font-medium">
+                                        <strong>Interpretasi Klinis:</strong> {latestFeedback.interpretation}
+                                    </div>
+                                </div>
+                            ) : (
+                                <div class="text-center py-16 text-xs text-slate-400 font-medium">Kirim rekor baru untuk memicu kalkulasi mesin analitis otomatis Aturan Westgard.</div>
+                            )}
+                        </div>
+                        <div class="text-[10px] text-slate-400 bg-slate-50 border p-3 rounded-xl leading-relaxed">
+                            💡 <strong>Urutan Prioritas Evaluasi</strong>: 13s ➔ 22s ➔ R4s ➔ 41s ➔ 10x ➔ Shift ➔ Trend ➔ 12s ➔ Diterima.
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- ANALYSIS & LEVEY-JENNINGS PAGE COMPONENT ---
+        function AnalysisComponent({ records, config }) {
+            const [level, setLevel] = React.useState('Low');
+            const [start, setStart] = React.useState('');
+            const [end, setEnd] = React.useState('');
+            const [activeFilter, setActiveFilter] = React.useState({ level: 'Low', start: '', end: '' });
+
+            const triggerAnalysis = () => {
+                setActiveFilter({ level, start, end });
+            };
+
+            const resetFilter = () => {
+                setLevel('Low'); setStart(''); setEnd('');
+                setActiveFilter({ level: 'Low', start: '', end: '' });
+            };
+
+            const dataset = React.useMemo(() => {
+                return records.filter(r => {
+                    if (r.control_level !== activeFilter.level) return false;
+                    if (activeFilter.start && r.qc_date < activeFilter.start) return false;
+                    if (activeFilter.end && r.qc_date > activeFilter.end) return false;
+                    return true;
+                }).sort((a,b) => new Date(a.qc_date + 'T' + a.qc_time) - new Date(b.qc_date + 'T' + b.qc_time));
+            }, [records, activeFilter]);
+
+            const latest = dataset[dataset.length - 1] || null;
+
+            React.useEffect(() => {
+                const canvas = document.getElementById('leveyJenningsCanvas');
+                if (!canvas) return;
+
+                const targetMeta = config[activeFilter.level];
+                const mean = targetMeta.mean_value;
+                const sd = targetMeta.sd_value;
+
+                const labels = dataset.map(d => d.qc_date);
+                const values = dataset.map(d => d.qc_result);
+
+                const count = labels.length || 1;
+                const chartData = {
+                    labels: labels.length ? labels : ['Belum Ada Data'],
+                    datasets: [
+                        { label: 'Titik Hasil QC', data: values, borderColor: '#2563EB', backgroundColor: '#2563EB', borderWidth: 2, pointRadius: 5, tension: 0.1, z: 10 },
+                        { label: 'Mean', data: Array(count).fill(mean), borderColor: '#10B981', borderWidth: 1.5, pointRadius: 0 },
+                        { label: '+1 SD', data: Array(count).fill(mean + sd), borderColor: '#F59E0B', borderWidth: 1, borderDash: [4, 4], pointRadius: 0 },
+                        { label: '+2 SD', data: Array(count).fill(mean + 2*sd), borderColor: '#EF4444', borderWidth: 1, borderDash: [4, 4], pointRadius: 0 },
+                        { label: '+3 SD', data: Array(count).fill(mean + 3*sd), borderColor: '#991B1B', borderWidth: 1.5, pointRadius: 0 },
+                        { label: '-1 SD', data: Array(count).fill(mean - sd), borderColor: '#F59E0B', borderWidth: 1, borderDash: [4, 4], pointRadius: 0 },
+                        { label: '-2 SD', data: Array(count).fill(mean - 2*sd), borderColor: '#EF4444', borderWidth: 1, borderDash: [4, 4], pointRadius: 0 },
+                        { label: '-3 SD', data: Array(count).fill(mean - 3*sd), borderColor: '#991B1B', borderWidth: 1.5, pointRadius: 0 }
+                    ]
+                };
+
+                const chart = new Chart(canvas, {
+                    type: 'line',
+                    data: chartData,
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            tooltip: {
+                                callbacks: {
+                                    afterBody: (ctx) => {
+                                        const r = dataset[ctx[0].dataIndex];
+                                        return r ? `Jam: ${r.qc_time}\nMean: ${r.mean}\nSD: ${r.sd}\nSDI: ${r.sdi.toFixed(2)}\nStatus: ${r.status}\nAturan: ${r.rule_violation}` : '';
+                                    }
+                                }
+                            }
+                        },
+                        scales: { y: { min: mean - 4*sd, max: mean + 4*sd } }
+                    }
+                });
+
+                return () => chart.destroy();
+            }, [dataset, activeFilter, config]);
+
+            return (
+                <div class="space-y-6">
+                    {/* Filter Panel Kontrol */}
+                    <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap gap-4 items-end text-xs">
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Level Kontrol</label>
+                            <select value={level} onChange={e => setLevel(e.target.value)} class="border border-slate-200 rounded-xl p-2 bg-white text-xs outline-none">
+                                <option value="Low">Low</option>
+                                <option value="Normal">Normal</option>
+                                <option value="High">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Tanggal Mulai</label>
+                            <input type="date" value={start} onChange={e => setStart(e.target.value)} class="border border-slate-200 rounded-xl p-2 text-xs outline-none" />
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Tanggal Selesai</label>
+                            <input type="date" value={end} onChange={e => setEnd(e.target.value)} class="border border-slate-200 rounded-xl p-2 text-xs outline-none" />
+                        </div>
+                        <div class="flex space-x-2">
+                            <button onClick={resetFilter} class="bg-slate-100 hover:bg-slate-200 text-slate-600 px-4 py-2 rounded-xl font-bold transition-all">Reset Filter</button>
+                            <button onClick={triggerAnalysis} class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl font-bold transition-all shadow-sm">Tampilkan Grafik</button>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                        {/* Grafik Levey-Jennings */}
+                        <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm lg:col-span-3 h-96 flex flex-col">
+                            <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Grafik Levey-Jennings (Level Kontrol: {activeFilter.level})</h4>
+                            <div class="flex-1 relative">
+                                {dataset.length === 0 ? (
+                                    <div class="absolute inset-0 flex items-center justify-center text-xs text-slate-400 font-medium bg-slate-50 border border-dashed border-slate-200 rounded-xl">No QC data available.</div>
+                                ) : <canvas id="leveyJenningsCanvas"></canvas>}
+                            </div>
+                        </div>
+
+                        {/* Panel Status Samping */}
+                        <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm h-96 flex flex-col justify-between overflow-y-auto">
+                            <div>
+                                <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider border-b pb-2 mb-3">Panel Informasi Status QC</h4>
+                                {latest ? (
+                                    <div class="space-y-2 text-xs">
+                                        <div><span class="text-slate-400 font-medium">Hasil QC Terakhir:</span> <strong class="text-slate-800 text-sm block">{latest.qc_result} mg/dL</strong></div>
+                                        <div><span class="text-slate-400 font-medium">Level Kontrol:</span> <strong class="text-slate-700 block">{latest.control_level}</strong></div>
+                                        <div class="grid grid-cols-2 gap-1 bg-slate-50 p-2 rounded-lg my-1">
+                                            <div><span class="text-[10px] text-slate-400 font-medium">Mean Target:</span> <strong class="block text-slate-700">{latest.mean}</strong></div>
+                                            <div><span class="text-[10px] text-slate-400 font-medium">Nilai SD:</span> <strong class="block text-slate-700">{latest.sd}</strong></div>
+                                        </div>
+                                        <div><span class="text-slate-400 font-medium">Nilai SDI:</span> <strong class="text-slate-800 font-mono block">{latest.sdi.toFixed(2)}</strong></div>
+                                        <div>
+                                            <span class="text-slate-400 font-medium block mb-0.5">Status Kontrol:</span>
+                                            <span class={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                latest.status === 'Accept' ? 'bg-emerald-100 text-emerald-800' : latest.status === 'Warning' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
+                                            }`}>{latest.status === 'Accept' ? 'Diterima' : latest.status === 'Warning' ? 'Peringatan' : 'Ditolak'}</span>
+                                        </div>
+                                        <div class="mt-2"><span class="text-slate-400 font-medium">Pelanggaran Aturan:</span> <strong class="text-rose-700 block font-mono">{latest.rule_violation}</strong></div>
+                                        <div class="mt-1 bg-blue-50/60 p-2 rounded border border-blue-100 text-[11px] text-slate-600 leading-normal font-medium">{latest.interpretation}</div>
+                                    </div>
+                                ) : (
+                                    <div class="text-center py-20 text-xs text-slate-400 font-medium">No QC data available.</div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- QC HISTORY TABLE COMPONENT ---
+        function QCHistoryComponent({ records }) {
+            const [search, setSearch] = React.useState('');
+            const [level, setLevel] = React.useState('All');
+            const [status, setStatus] = React.useState('All');
+            const [date, setDate] = React.useState('');
+            const [page, setPage] = React.useState(1);
+
+            const filtered = React.useMemo(() => {
+                return records.filter(r => {
+                    if (level !== 'All' && r.control_level !== level) return false;
+                    if (status !== 'All' && r.status !== status) return false;
+                    if (date && r.qc_date !== date) return false;
+                    if (search && !r.analyst_name.toLowerCase().includes(search.toLowerCase())) return false;
+                    return true;
+                }).reverse();
+            }, [records, search, level, status, date]);
+
+            // Mekanisme batasan 10 rekor data per halaman (Pagination)
+            const recordsPerPage = 10;
+            const totalPages = Math.ceil(filtered.length / recordsPerPage) || 1;
+            const paginatedRows = React.useMemo(() => {
+                const offset = (page - 1) * recordsPerPage;
+                return filtered.slice(offset, offset + recordsPerPage);
+            }, [filtered, page]);
+
+            React.useEffect(() => { setPage(1); }, [search, level, status, date]);
+
+            return (
+                <div class="space-y-4">
+                    {/* Panel Filter Data Riwayat */}
+                    <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap gap-4 items-end text-xs">
+                        <div class="flex-1 min-w-[180px]">
+                            <label class="block font-bold text-slate-400 mb-1">Cari Nama Analis</label>
+                            <input type="text" placeholder="Ketik nama..." value={search} onChange={e => setSearch(e.target.value)} class="w-full border border-slate-200 rounded-xl p-2 text-xs outline-none" />
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Level Kontrol</label>
+                            <select value={level} onChange={e => setLevel(e.target.value)} class="border border-slate-200 rounded-xl p-2 bg-white text-xs outline-none">
+                                <option value="All">Semua Level</option>
+                                <option value="Low">Low</option>
+                                <option value="Normal">Normal</option>
+                                <option value="High">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Status</label>
+                            <select value={status} onChange={e => setStatus(e.target.value)} class="border border-slate-200 rounded-xl p-2 bg-white text-xs outline-none">
+                                <option value="All">Semua Status</option>
+                                <option value="Accept">Accept</option>
+                                <option value="Warning">Warning</option>
+                                <option value="Reject">Reject</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Pilih Tanggal</label>
+                            <input type="date" value={date} onChange={e => setDate(e.target.value)} class="border border-slate-200 rounded-xl p-2 text-xs outline-none" />
+                        </div>
+                    </div>
+
+                    {/* Tabel Riwayat */}
+                    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left text-xs">
+                                <thead class="bg-slate-50 text-slate-400 font-bold border-b border-slate-200 uppercase tracking-wider">
+                                    <tr>
+                                        <th class="p-4">No</th>
+                                        <th class="p-4">Tanggal / Waktu</th>
+                                        <th class="p-4">Nama Analis</th>
+                                        <th class="p-4">Level Kontrol</th>
+                                        <th class="p-4">Hasil QC</th>
+                                        <th class="p-4">Mean</th>
+                                        <th class="p-4">SD</th>
+                                        <th class="p-4">SDI</th>
+                                        <th class="p-4">Status</th>
+                                        <th class="p-4">Pelanggaran Aturan</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-100 font-medium text-slate-700">
+                                    {paginatedRows.length === 0 ? (
+                                        <tr><td colSpan="10" class="p-8 text-center text-slate-400 font-medium">No QC history available.</td></tr>
+                                    ) : (
+                                        paginatedRows.map((r, idx) => {
+                                            const globalIndex = filtered.length - ((page - 1) * recordsPerPage + idx);
+                                            return (
+                                                <tr key={r.id} class="hover:bg-slate-50/70">
+                                                    <td class="p-4 font-mono font-bold text-slate-400">{globalIndex}</td>
+                                                    <td class="p-4 whitespace-nowrap">{r.qc_date} <span class="text-[10px] text-slate-400 block mt-0.5">{r.qc_time}</span></td>
+                                                    <td class="p-4 font-bold text-slate-800 max-w-[140px] truncate">{r.analyst_name}</td>
+                                                    <td class="p-4"><span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700">{r.control_level}</span></td>
+                                                    <td class="p-4 font-black text-blue-600">{r.qc_result} mg/dL</td>
+                                                    <td class="p-4 font-mono text-slate-400">{r.mean}</td>
+                                                    <td class="p-4 font-mono text-slate-400">{r.sd}</td>
+                                                    <td class="p-4 font-mono font-bold text-slate-800">{r.sdi.toFixed(2)}</td>
+                                                    <td class="p-4">
+                                                        <span class={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                            r.status === 'Accept' ? 'bg-emerald-100 text-emerald-800' : r.status === 'Warning' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
+                                                        }`}>{r.status}</span>
+                                                    </td>
+                                                    <td class="p-4 font-mono font-bold text-slate-500">{r.rule_violation}</td>
+                                                </tr>
+                                            );
+                                        })
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+
+                        {/* Navigasi Pagination */}
+                        <div class="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between text-xs">
+                            <span class="text-slate-400 font-medium">Menampilkan halaman <strong>{page}</strong> dari {totalPages} ({filtered.length} total baris)</span>
+                            <div class="flex space-x-1">
+                                <button disabled={page === 1} onClick={() => setPage(p => p - 1)} class="px-3 py-1.5 rounded-lg border bg-white font-bold disabled:opacity-50 text-slate-600">Sebelumnya</button>
+                                <button disabled={page === totalPages} onClick={() => setPage(p => p + 1)} class="px-3 py-1.5 rounded-lg border bg-white font-bold disabled:opacity-50 text-slate-600">Selanjutnya</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- EXPORT REPORTS COMPONENT ---
+        function ReportsComponent({ records }) {
+            const [start, setStart] = React.useState('');
+            const [end, setEnd] = React.useState('');
+            const [level, setLevel] = React.useState('Low');
+            const [preview, setPreview] = React.useState(false);
+
+            const scopeRows = React.useMemo(() => {
+                return records.filter(r => {
+                    if (r.control_level !== level) return false;
+                    if (start && r.qc_date < start) return false;
+                    if (end && r.qc_date > end) return false;
+                    return true;
+                }).sort((a,b) => new Date(a.qc_date + 'T' + a.qc_time) - new Date(b.qc_date + 'T' + b.qc_time));
+            }, [records, start, end, level]);
+
+            const summary = React.useMemo(() => {
+                return {
+                    total: scopeRows.length,
+                    accept: scopeRows.filter(r => r.status === 'Accept').length,
+                    warning: scopeRows.filter(r => r.status === 'Warning').length,
+                    reject: scopeRows.filter(r => r.status === 'Reject').length,
+                };
+            }, [scopeRows]);
+
+            const runExcelExport = async () => {
+                if(scopeRows.length === 0) { alert('Tidak ada rekor data QC yang cocok dengan filter.'); return; }
+                const wb = new ExcelJS.Workbook();
+                const ws = wb.addWorksheet('Laporan QC Glukosa');
+
+                ws.columns = [
+                    { header: 'Tanggal QC', key: 'qc_date', width: 14 },
+                    { header: 'Waktu Uji', key: 'qc_time', width: 10 },
+                    { header: 'Nama Lengkap Analis', key: 'analyst_name', width: 25 },
+                    { header: 'Level Kontrol', key: 'control_level', width: 15 },
+                    { header: 'Hasil Nilai QC', key: 'qc_result', width: 14 },
+                    { header: 'Target Mean', key: 'mean', width: 12 },
+                    { header: 'Batas SD', key: 'sd', width: 10 },
+                    { header: 'Kalkulasi SDI', key: 'sdi', width: 14 },
+                    { header: 'Status Kontrol', key: 'status', width: 14 },
+                    { header: 'Aturan Westgard', key: 'rule_violation', width: 18 }
+                ];
+
+                scopeRows.forEach(r => ws.addRow(r));
+                
+                const buffer = await wb.xlsx.writeBuffer();
+                const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                const uri = window.URL.createObjectURL(blob);
+                const el = document.createElement('a');
+                el.href = uri;
+                el.download = `LABQC_Glukosa_Level_${level}_Laporan.xlsx`;
+                el.click();
+            };
+
+            const runPDFExport = () => {
+                if(scopeRows.length === 0) { alert('Tidak ada rekor data QC yang cocok dengan filter.'); return; }
+                const { jsPDF } = window.jspdf;
+                const pdf = new jsPDF();
+
+                pdf.setFont('helvetica', 'bold');
+                pdf.setFontSize(22);
+                pdf.text("LABQC MONITOR", 15, 20);
+                pdf.setFontSize(11);
+                pdf.setFont('helvetica', 'normal');
+                pdf.text("Sistem Pemantauan Kendali Mutu Internal Glukosa", 15, 26);
+                
+                pdf.setDrawColor(220, 225, 230);
+                pdf.line(15, 30, 195, 30);
+
+                pdf.setFontSize(10);
+                pdf.text(`Level Kontrol Target: ${level}`, 15, 40);
+                pdf.text(`Rentang Waktu: ${start || 'Semua'} s/d ${end || 'Semua'}`, 15, 46);
+                pdf.text(`Tanggal Cetak Laporan: ${new Date().toLocaleDateString('id-ID')}`, 15, 52);
+
+                pdf.rect(15, 58, 180, 25);
+                pdf.text(`Total Baris Rekor: ${summary.total}`, 20, 64);
+                pdf.text(`Hasil Diterima (Accept): ${summary.accept}`, 20, 70);
+                pdf.text(`Hasil Peringatan (Warning): ${summary.warning}`, 20, 76);
+                pdf.text(`Hasil Ditolak (Reject): ${summary.reject}`, 110, 64);
+
+                let cursorY = 95;
+                pdf.setFont('helvetica', 'bold');
+                pdf.text("Audit Jejak Riwayat Kronologis Dokumen:", 15, cursorY);
+                cursorY += 7;
+                pdf.setFont('helvetica', 'normal');
+                pdf.setFontSize(9);
+
+                scopeRows.forEach((r, idx) => {
+                    if (cursorY > 275) { pdf.addPage(); cursorY = 20; }
+                    pdf.text(`${idx+1}. Tanggal: ${r.qc_date} ${r.qc_time} | Analis: ${r.analyst_name} | Hasil: ${r.qc_result} | SDI: ${r.sdi.toFixed(2)} | Status: ${r.status} [${r.rule_violation}]`, 15, cursorY);
+                    cursorY += 6;
+                });
+
+                pdf.save(`LABQC_Glukosa_Laporan_Level_${level}.pdf`);
+            };
+
+            return (
+                <div class="space-y-6 max-w-4xl">
+                    {/* Parameter Rentang Ekspor */}
+                    <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap gap-4 items-end text-xs">
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Level Kontrol Sasaran</label>
+                            <select value={level} onChange={e => { setLevel(e.target.value); setPreview(false); }} class="border border-slate-200 rounded-xl p-2 bg-white text-xs outline-none">
+                                <option value="Low">Low</option>
+                                <option value="Normal">Normal</option>
+                                <option value="High">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Tanggal Awal</label>
+                            <input type="date" value={start} onChange={e => { setStart(e.target.value); setPreview(false); }} class="border border-slate-200 rounded-xl p-2 text-xs outline-none" />
+                        </div>
+                        <div>
+                            <label class="block font-bold text-slate-400 mb-1">Tanggal Akhir</label>
+                            <input type="date" value={end} onChange={e => { setEnd(e.target.value); setPreview(false); }} class="border border-slate-200 rounded-xl p-2 text-xs outline-none" />
+                        </div>
+                        <div class="flex space-x-2">
+                            <button onClick={() => setPreview(true)} class="bg-slate-800 text-white font-bold px-4 py-2 rounded-xl transition-all">Pratinjau Laporan</button>
+                            <button onClick={runExcelExport} class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-2 rounded-xl transition-all shadow-sm">Ekspor Excel</button>
+                            <button onClick={runPDFExport} class="bg-rose-600 hover:bg-rose-700 text-white font-bold px-4 py-2 rounded-xl transition-all shadow-sm">Ekspor PDF</button>
+                        </div>
+                    </div>
+
+                    {/* Pratinjau Lembar Laporan Cetak */}
+                    {preview && (
+                        <div class="bg-white p-8 rounded-2xl border border-slate-200 shadow-md space-y-6">
+                            <div class="text-center border-b pb-4">
+                                <h2 class="text-xl font-extrabold text-slate-900 tracking-wide">LABQC MONITOR</h2>
+                                <p class="text-xs text-slate-400 uppercase tracking-widest mt-0.5">Glucose Quality Control Monitoring System</p>
+                            </div>
+
+                            <div class="grid grid-cols-2 gap-4 text-xs font-medium text-slate-600">
+                                <div>
+                                    <p>Rentang Filter Tanggal: <strong class="text-slate-800">{start || 'Semua'} s/d {end || 'Semua'}</strong></p>
+                                    <p class="mt-1">Level Kontrol Terpilih: <strong class="text-slate-800">Kontrol Level {level}</strong></p>
+                                </div>
+                                <div class="text-right">
+                                    <p>Total Rekor Data QC Ditemukan: <strong class="text-blue-600 font-mono font-bold">{summary.total}</strong></p>
+                                    <p class="mt-1">Tanggal Ekstraksi Dokumen: <strong class="text-slate-800">{new Date().toLocaleDateString('id-ID')}</strong></p>
+                                </div>
+                            </div>
+
+                            <div class="grid grid-cols-4 gap-4 text-center bg-slate-50 p-4 rounded-xl border border-slate-100">
+                                <div><span class="text-[10px] uppercase font-bold text-slate-400">Total Log</span><p class="text-lg font-black text-slate-800">{summary.total}</p></div>
+                                <div><span class="text-[10px] uppercase font-bold text-emerald-500">Accept</span><p class="text-lg font-black text-emerald-600">{summary.accept}</p></div>
+                                <div><span class="text-[10px] uppercase font-bold text-amber-500">Warning</span><p class="text-lg font-black text-amber-600">{summary.warning}</p></div>
+                                <div><span class="text-[10px] uppercase font-bold text-rose-500">Reject</span><p class="text-lg font-black text-rose-600">{summary.reject}</p></div>
+                            </div>
+
+                            <div class="border rounded-xl overflow-hidden text-xs">
+                                <div class="p-3 bg-slate-50 font-bold border-b border-slate-200 text-slate-500">DAFTAR LOG JURNAL KRONOLOGIS INTERNAL</div>
+                                <div class="max-h-48 overflow-y-auto divide-y">
+                                    {scopeRows.length === 0 ? (
+                                        <div class="p-6 text-center text-slate-400 font-medium">Tidak ada rekor riwayat data uji yang ditemukan berdasarkan aturan cakupan filter.</div>
+                                    ) : (
+                                        scopeRows.map((r, i) => (
+                                            <div key={i} class="p-2.5 flex justify-between font-medium hover:bg-slate-50/50">
+                                                <span>⏱️ {r.qc_date} {r.qc_time} | Analis: <strong>{r.analyst_name}</strong></span>
+                                                <span>Hasil Uji: <strong>{r.qc_result} mg/dL</strong> | SDI: <span class="font-mono">{r.sdi.toFixed(2)}</span> | <span class="font-bold text-slate-600">[{r.rule_violation}]</span></span>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // --- CONFIGURATION SETTINGS COMPONENT ---
+        function SettingsComponent({ config, syncConfig, triggerAlert, user, setUser }) {
+            const [lowMean, setLowMean] = React.useState(config.Low.mean_value);
+            const [lowSd, setLowSd] = React.useState(config.Low.sd_value);
+            const [normMean, setNormMean] = React.useState(config.Normal.mean_value);
+            const [normSd, setNormSd] = React.useState(config.Normal.sd_value);
+            const [highMean, setHighMean] = React.useState(config.High.mean_value);
+            const [highSd, setHighSd] = React.useState(config.High.sd_value);
+
+            const [inputName, setInputName] = React.useState(user.name);
+            const [inputRole, setInputRole] = React.useState(user.role);
+
+            const handleSaveCalibration = (e) => {
+                e.preventDefault();
+                const updateConfig = {
+                    Low: { mean_value: parseFloat(lowMean), sd_value: parseFloat(lowSd) },
+                    Normal: { mean_value: parseFloat(normMean), sd_value: parseFloat(normSd) },
+                    High: { mean_value: parseFloat(highMean), sd_value: parseFloat(highSd) }
+                };
+                syncConfig(updateConfig);
+                triggerAlert('success', 'Konfigurasi Target Nilai Mutu Nilai Mean & SD Berhasil Diperbarui.');
+            };
+
+            const handleSaveProfile = (e) => {
+                e.preventDefault();
+                const updatedUser = { ...user, name: inputName, role: inputRole };
+                setUser(updatedUser);
+                localStorage.setItem('auth_user', JSON.stringify(updatedUser));
+                triggerAlert('success', 'Informasi akun otentikasi profil berhasil diubah.');
+            };
+
+            return (
+                <div class="space-y-6 max-w-4xl">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        {/* Formulir Kalibrasi Parameter */}
+                        <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm md:col-span-2">
+                            <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider border-b pb-2 mb-4">Konfigurasi Kalibrasi Nilasi Batas Target Mutu Parameter</h4>
+                            <form onSubmit={handleSaveCalibration} class="space-y-4 text-xs">
+                                {/* Low Level Form */}
+                                <div class="p-3 bg-slate-50 border rounded-xl grid grid-cols-3 gap-3 items-center">
+                                    <span class="font-bold text-blue-500 text-xs">Level Low</span>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-0.5">Nilai Mean</label>
+                                        <input type="number" step="0.01" value={lowMean} onChange={e => setLowMean(e.target.value)} required class="w-full border p-1.5 rounded font-mono font-bold" />
+                                    </div>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-0.5">Nilai Batas SD</label>
+                                        <input type="number" step="0.01" value={lowSd} onChange={e => setLowSd(e.target.value)} required class="w-full border p-1.5 rounded font-mono font-bold" />
+                                    </div>
+                                </div>
+                                {/* Normal Level Form */}
+                                <div class="p-3 bg-slate-50 border rounded-xl grid grid-cols-3 gap-3 items-center">
+                                    <span class="font-bold text-blue-600 text-xs">Level Normal</span>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-0.5">Nilai Mean</label>
+                                        <input type="number" step="0.01" value={normMean} onChange={e => setNormMean(e.target.value)} required class="w-full border p-1.5 rounded font-mono font-bold" />
+                                    </div>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-0.5">Nilai Batas SD</label>
+                                        <input type="number" step="0.01" value={normSd} onChange={e => setNormSd(e.target.value)} required class="w-full border p-1.5 rounded font-mono font-bold" />
+                                    </div>
+                                </div>
+                                {/* High Level Form */}
+                                <div class="p-3 bg-slate-50 border rounded-xl grid grid-cols-3 gap-3 items-center">
+                                    <span class="font-bold text-blue-800 text-xs">Level High</span>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-0.5">Nilai Mean</label>
+                                        <input type="number" step="0.01" value={highMean} onChange={e => setHighMean(e.target.value)} required class="w-full border p-1.5 rounded font-mono font-bold" />
+                                    </div>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-0.5">Nilai Batas SD</label>
+                                        <input type="number" step="0.01" value={highSd} onChange={e => setHighSd(e.target.value)} required class="w-full border p-1.5 rounded font-mono font-bold" />
+                                    </div>
+                                </div>
+                                <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 py-2 rounded-xl transition-all shadow-sm">Simpan Konfigurasi</button>
+                            </form>
+                        </div>
+
+                        {/* Profil Autentikasi Pengguna */}
+                        <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                            <div>
+                                <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider border-b pb-2 mb-3">Akun Pengguna (Supabase Auth)</h4>
+                                <form onSubmit={handleSaveProfile} class="space-y-3 text-xs">
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-1">Nama Pengguna Akun</label>
+                                        <input type="text" value={inputName} onChange={e => setInputName(e.target.value)} required class="w-full border p-2 rounded-xl" />
+                                    </div>
+                                    <div>
+                                        <label class="block font-bold text-slate-400 mb-1">Hak Akses Peran (Role)</label>
+                                        <select value={inputRole} onChange={e => setInputRole(e.target.value)} class="w-full border p-2 rounded-xl bg-white">
+                                            <option value="Analyst">Analyst</option>
+                                            <option value="Supervisor">Supervisor</option>
+                                        </select>
+                                    </div>
+                                    <button type="submit" class="w-full bg-slate-800 text-white font-bold py-2 rounded-xl transition-all">Perbarui Profil Akun</button>
+                                </form>
+                            </div>
+                            
+                            <div class="pt-2 border-t text-[11px] text-slate-400 space-y-1">
+                                <p class="font-bold text-slate-500 uppercase tracking-wide text-[10px]">Informasi Sistem</p>
+                                <p>Mesin Pengolah: <strong>LabQC Core v2.4-ID</strong></p>
+                                <p>Parameter Uji Klinis: <span class="font-bold text-blue-600">GLUKOSA (Spesifik)</span></p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
